@@ -8,7 +8,7 @@ An independent Wix integration research project maintained by Waypoint. It is no
 
 ## Research
 
-See [PLATFORM-RESEARCH.md](PLATFORM-RESEARCH.md) for integration routes, partnership questions, and official references.
+See [PLATFORM-RESEARCH.md](PLATFORM-RESEARCH.md) for the hard constraint, the per-site Velo route, the PSP onboarding distinction, and official references.
 
 ## Ownership and disclaimer
 

@@ -1,0 +1,16 @@
+Waypoint WiPay for Wix — third-party notices
+
+This project references and depends on the behavior of third-party platforms and APIs:
+
+- Wix.com — Wix Payments, Wix Stores, Velo, the Payment Provider Service Plugin, the Wix
+  Orders API, and the Wix dashboard/User Experience are services of Wix.com. Their terms,
+  documentation, and platform limitations govern use of this plugin. See Wix's official
+  documentation and Terms of Use.
+
+- WiPay — the Payments API, hosted checkout pages, transaction responses, webhooks, refund
+  workflow, and sandbox are services of WiPay. Their API documentation, test-card guidance,
+  and Terms govern the payment behavior this plugin implements. See WiPay's official
+  documentation.
+
+Neither WiPay nor Wix endorse this project. This is an independent integration maintained by
+Waypoint.

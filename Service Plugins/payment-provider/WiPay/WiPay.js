@@ -2,93 +2,126 @@
  * @file WiPay.js
  * @description Core of the WiPay Payment Provider Service Plugin.
  *
- * Wix calls these functions at checkout time. They must be annotated for Velo or exported as
- * module members depending on how Wix loads the plugin. The exact Wix surface (which function
- * names Wix imports, how it wraps them) is defined in Wix's service-plugin reference pages.
+ * Wix calls these functions at checkout time. The Wix-side surface (exact option shapes, the
+ * hosted-page return property, the full submitEvent schema) is still confirmed only to the level
+ * recorded in SERVICE-PLUGIN-CONTRACT-NOTES.md, and every such gap is flagged as a TODO below
+ * rather than hard-coded from guesswork.
  *
- * Hosted-page note: WiPay Payment Request can return a hosted checkout URL a buyer completes on
- * WiPay's page. For hosted-page payment methods Wix documents that they do NOT support 3D Secure
+ * The WiPay side of this file is real: payload construction, the Payment Request call, buyer-return
+ * hash verification, webhook signature verification, and the WAPI refund call all go through
+ * wipay-core.js, which the harness (tests/harness.mjs) cross-checks against Node's crypto and
+ * exercises against the live TT sandbox.
+ *
+ * Hosted-page note: WiPay Payment Request returns a hosted checkout URL the buyer completes on
+ * WiPay's page. Wix documents that hosted-page payment methods do NOT support 3D Secure
  * verification or recurring payments — that constraint applies here too.
  *
  * Sources for the WiPay contract used below:
  *   - Payments API / Payment Request: https://dev.wipay.com/docs/api/payments/operation/create-a-payment-request
- *   - Payment Request request/response shape, account/order_id/total/response_url semantics:
- *     https://dev.wipay.com/docs/api/payments/introduction
  *   - Buyer return (response_url) and pin-hash verification:
  *     https://dev.wipay.com/docs/api/payments/introduction#buyer-return-response_url
  *   - Webhooks (HMAC, replay protection, dedupe):
  *     https://dev.wipay.com/docs/api/payments/introduction#webhooks
- *   - Refund (WAPI refund-request endpoint, refund request succeeds with message):
- *     https://dev.wipay.com/docs/api/wapi/introduction
- *   - Sandbox values (test account, 123-is-for-hash-only, etc.):
- *     https://dev.wipay.com/docs/api/payments/introduction
+ *   - Refund (WAPI refund-request endpoint): https://dev.wipay.com/docs/api/wapi/introduction
  *
  * Wix redirection/hosted-page model (confirmed from Wix sample-payment-flows page):
  *   - Wix sends `order.returnUrls` (success / error / cancel / pending) in the Create Transaction request.
- *   - For hosted-page payments, the PSP returns `redirectUrl`; Wix opens that URL in an iframe or
- *     browser window for the buyer to complete.
- *   - The buyer lands on the appropriate `returnUrl`; final status is delivered by the PSP to Wix via
- *     Submit Event, not returned as a final value from Create Transaction.
- *   - For hosted-page payments, the `paymentMethod` value in the Create Transaction request is a string
- *     representing the PSP's Wix app ID.
- *   - Hard constraint from Wix docs: "Hosted-page payment methods don't support 3D Secure verification
- *     or recurring payments."
- *   - Open item: exact JSON shapes for the Create Transaction request and Submit Event webhook are shown
- *     in Wix docs as "Copy" code blocks that did not render into extracted text; do not hard-code field
- *     names from guesswork — confirm from the live Wix page before shipping.
+ *   - For hosted-page payments, the PSP returns `redirectUrl`; Wix opens that URL for the buyer.
+ *   - Final status is delivered to Wix via Submit Event, not returned from Create Transaction.
+ *   - Hard constraint: "Hosted-page payment methods don't support 3D Secure verification or
+ *     recurring payments."
  *
- * TODO (exact Wix return / event shapes): the exact JSON passed into createTransaction() by Wix and the
- * exact properties Wix expects back (for hosted-page return, especially the redirect property and the
- * pluginTransactionId surface) are defined in Wix's service-plugin reference pages and need confirmation
- * before finalizing the return shape. The current implementation follows the contract described in
- * SERVICE-PLUGIN-CONTRACT-NOTES.md and flags the Wix-side gaps as TODOs.
+ * TODO (exact Wix return / event shapes): the exact JSON passed into createTransaction() by Wix and
+ * the exact properties Wix expects back are in Wix "Copy" code blocks that did not render into
+ * extractable text; confirm from the live Wix reference before shipping. Do not hard-code.
  */
 
-// ---------------------------------------------------------------------------
-// WiPay Payment Request field names we pass through to the Payments API.
-// These match the WiPay create-a-payment-request operation and the field semantics
-// in the Payment Request introduction. Confirm each field name spelling against the live
-// API reference before treating the request body as finalized.
-// ---------------------------------------------------------------------------
-const PAYMENT_REQUEST_FIELDS = [
-  'account',               // WiPay account number (identity, no auth header)
-  'environment',           // sandbox or live
-  'country_code',          // e.g. TT, JM, BB
-  'currency',              // e.g. JMD
-  'fee_structure',         // e.g. customer_pay
-  'method',                // credit_card_co or 3co_simple; for hosted page the PSP’s Wix app ID
-  'order_id',              // merchant order id
-  'origin',                // e.g. wix
-  'total',                 // order total
-  'response_url',          // where WiPay posts the buyer return / status callback
-  'email',                 // buyer email (optional)
-  'first_name',            // optional
-  'last_name',             // optional
-  'phone_number',          // optional
-  'return_url',            // optional, distinct from response_url in some flows
-];
+import {
+  buildPaymentRequest as buildCorePayload,
+  parseCheckoutResponse,
+  paymentEndpoint,
+  wapiEndpoint,
+  wapiEnvironment,
+  generateOrderId as coreGenerateOrderId,
+  responseHash,
+  verifyResponseHash,
+  verifyWebhookSignature,
+  isValidTransactionId,
+} from './wipay-core.js';
 
 // ---------------------------------------------------------------------------
-// State / lookup helpers (stubs)
+// Runtime fetch.
+//
+// Node 18+ and modern server runtimes expose a global `fetch`. Velo's backend historically
+// exposes `fetch` via the `wix-fetch` module instead.
+// TODO (Velo runtime): confirm whether Velo backend provides a global fetch. If it does not,
+// change this to `import { fetch } from 'wix-fetch'` and keep the rest of this file unchanged.
 // ---------------------------------------------------------------------------
+function runtimeFetch() {
+  if (typeof fetch === 'function') {
+    return fetch;
+  }
+  throw new Error(
+    'No global fetch in this runtime. On Velo, import { fetch } from \'wix-fetch\' and pass it in.'
+  );
+}
 
-/**
- * resolveOriginalTotal(pluginTransactionId)
- *
- * Returns the original order total for the given WiPay transaction, formatted to exactly two
- * decimals (e.g. "10.00"). Required for buyer-return hash verification because the hash must be
- * computed over the original submitted amount, not the buyer-facing total returned in the redirect.
- *
- * Implementation notes:
- *   - We must store the original total somewhere Wix can retrieve it later (Wix order metadata, the
- *     plugin’s stored transaction state, or as part of the `data` pass-through echoed back by WiPay).
- *   - Decide the storage strategy before shipping; do not rely on reconstructing it from the redirect.
- *
- * TODO: implement using a real Wix-side store for the original total keyed by pluginTransactionId.
- */
-function resolveOriginalTotal(pluginTransactionId) {
-  // TODO: look up and return the original total for this transaction.
-  throw new Error('resolveOriginalTotal not implemented');
+// Allows the test harness to exercise these paths against a stubbed transport
+// without a network. Production never calls this.
+let transportOverride = null;
+export function __setTransportForTests(fn) {
+  transportOverride = fn;
+}
+
+// ---------------------------------------------------------------------------
+// In-memory original-total store.
+//
+// The buyer-return hash must be computed over the ORIGINAL submitted amount, so we must be able
+// to recover it from the WiPay transaction id at callback time.
+//
+// Two independent sources, in priority order:
+//   1. The `data` pass-through field. WiPay documents `data` as echoed back in both the buyer
+//      return and the webhook, which makes it a contract-backed place to pin the amount. This is
+//      the durable path — it survives isolate recycling and does not need a database.
+//   2. This process-local map, as a fallback for callbacks where `data` did not round-trip.
+//
+// The map is per-isolate and non-durable: if it is empty at callback time we MUST be able to fall
+// back to (1), and if neither source yields a total we reject the callback rather than verify
+// against a guessed amount.
+//
+// TODO (durability): if Wix-side durable storage (e.g. wix-data) is available to the plugin, mirror
+// this map into it. Until then `data` is the source of truth and this map is an optimization.
+// ---------------------------------------------------------------------------
+const originalTotals = new Map();
+
+function rememberOriginalTotal(pluginTransactionId, originalTotal) {
+  if (!isValidTransactionId(pluginTransactionId)) {
+    throw new Error('Refusing to store original total under an invalid transaction id.');
+  }
+  originalTotals.set(String(pluginTransactionId), String(originalTotal));
+}
+
+function resolveOriginalTotal(pluginTransactionId, dataEcho) {
+  // 1. Contract-backed echo first: WiPay returns `data` verbatim.
+  if (dataEcho) {
+    try {
+      const parsed = typeof dataEcho === 'string' ? JSON.parse(dataEcho) : dataEcho;
+      if (parsed && parsed.total != null) {
+        const total = Number(parsed.total);
+        if (isFinite(total) && total > 0) {
+          return total.toFixed(2);
+        }
+      }
+    } catch {
+      // Fall through to the local map rather than failing outright.
+    }
+  }
+  // 2. Process-local fallback.
+  const remembered = originalTotals.get(String(pluginTransactionId));
+  if (remembered) {
+    return remembered;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,10 +131,13 @@ function resolveOriginalTotal(pluginTransactionId) {
 /**
  * Build the WiPay Payment Request JSON for createTransaction.
  *
+ * Field names, casing, fee-structure normalization, total formatting and prefill limits are all
+ * delegated to wipay-core.js so this file never restates the contract.
+ *
  * @param {object} options - Wix transaction options (from Wix's createTransaction call).
  * @param {object} context - Wix context, includes context.credentials after Connect.
- * @param {object} orderInfo - merchant order data (items, totals, buyer, etc.).
- * @returns {object} - Payment Request payload suitable for the WiPay Payments API.
+ * @param {object} orderInfo - merchant order data (total, currency, buyer, etc.).
+ * @returns {object} - Payment Request payload for the WiPay Payments API.
  */
 function buildPaymentRequest(options, context, orderInfo) {
   const creds = context.credentials;
@@ -115,86 +151,56 @@ function buildPaymentRequest(options, context, orderInfo) {
     throw new Error('Invalid order total for WiPay Payment Request.');
   }
 
-  const payload = {};
+  // Wix's hosted-page flow sends order.returnUrls; response_url is where WiPay sends the buyer
+  // return that this plugin verifies. It must be a published-site HTTPS function URL.
+  // TODO (exact response_url wiring): confirm from the Wix reference how the plugin's HTTP function
+  // URL is derived for the site so we do not ship a placeholder that will not resolve.
+  const responseUrl =
+    orderInfo.responseUrl ||
+    (orderInfo.returnUrls && orderInfo.returnUrls.success) ||
+    null;
 
-  // --- identity / environment ---
-  payload.account = creds.accountNumber;
-  // Toggle between sandbox and live. Drive from the merchant's chosen WiPay environment or a site
-  // setting in production. For now we default to sandbox so the plugin can be tested against WiPay
-  // sandbox first.
-  // TODO: wire the environment from a real merchant setting / credentials rather than a hard default.
-  payload.environment = 'sandbox';
-
-  // --- country + currency ---
-  if (orderInfo.countryCode) payload.country_code = orderInfo.countryCode;
-  if (orderInfo.currency) payload.currency = orderInfo.currency;
-
-  // --- fee structure ---
-  // WiPay accepts fee_structure values like customer_pay / merchant_absorb / split.
-  if (orderInfo.feeStructure) payload.fee_structure = orderInfo.feeStructure;
-
-  // --- method ---
-  // For hosted-page payment methods in Wix, the paymentMethod value in the Create Transaction
-  // request body is "a string representing the PSP's Wix app ID." The exact string to pass here for
-  // WiPay's Wix app ID is a Wix-side value we must confirm from the Wix service-plugin reference.
-  // Until then we pass a clearly-marked placeholder.
-  payload.method = orderInfo.method || 'WIX_APP_ID_FOR_WIPAY'; // TODO: replace with confirmed Wix app ID
-
-  // --- order identity ---
-  // WiPay needs a merchant order_id. Generate or pass through one from the Wix order.
-  // Decide the origin/order_id generation and idempotency strategy (see TODO in notes).
-  payload.order_id = orderInfo.orderId || generateOrderId();
-  payload.origin = orderInfo.origin || 'wix';
-
-  // --- amount ---
-  payload.total = total.toFixed(2);
-
-  // --- buyer return ---
-  // response_url is where WiPay posts the buyer return. Wix's hosted-page flow sends
-  // order.returnUrls (success / error / cancel / pending); the buyer ends up on the right
-  // returnUrl and the status flows back to Wix through Submit Event. The WiPay response_url should
-  // point at the Wix HTTP function that verifies the hash and calls submitEvent.
-  //
-  // TODO (exact response_url / Wix return url wiring): confirm from Wix reference whether the Wix
-  // plugin should set response_url to a Wix HTTP function URL and how Wix maps the buyer return on
-  // its returnUrls to that callback. Do not hardcode a URL that will not resolve in the published site.
-  if (orderInfo.responseUrl) {
-    payload.response_url = orderInfo.responseUrl;
-  } else {
-    // Fallback placeholder for local / preview development only. Replace with a real published site
-    // HTTPS function URL before any live test.
-    payload.response_url = 'https://placeholder.example/wipay-response';
+  if (!responseUrl) {
+    // TODO: derive the real published-site function URL instead of failing. Kept as a hard error
+    // rather than a placeholder so an unwired callback can never be presented as working.
+    throw new Error(
+      'response_url is required by WiPay Payment Request and was not provided by Wix. ' +
+      'Confirm the hosted-page return URL wiring in the Wix reference before testing.'
+    );
   }
 
-  // --- optional buyer / display fields ---
-  if (orderInfo.email) payload.email = orderInfo.email;
-  if (orderInfo.firstName) payload.first_name = orderInfo.firstName;
-  if (orderInfo.lastName) payload.last_name = orderInfo.lastName;
-  if (orderInfo.phone) payload.phone_number = orderInfo.phone;
-
-  // --- line items if WiPay Payment Request supports them ---
-  if (orderInfo.items && orderInfo.items.length) {
-    payload.items = orderInfo.items.map((item) => ({
-      name: item.name || 'Item',
-      amount: Number(item.amount).toFixed(2),
-      quantity: item.quantity || 1,
-    }));
-  }
-
-  return payload;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: generate a merchant order id when the Wix order does not provide one.
-// ---------------------------------------------------------------------------
-
-/**
- * Generate an order id for the WiPay Payment Request.
- * Replace with a real strategy tied to the Wix order / site. Current implementation is a placeholder.
- */
-function generateOrderId() {
-  // TODO: replace with a real order-id strategy (Wix order id, site prefix, idempotency key).
-  return 'WIX-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+  // `data` is the contract-backed carrier for the pinned original total: WiPay echoes it in both
+  // the buyer return and the webhook, which is what lets the callback recompute the hash without
+  // trusting any buyer-visible field.
+  return buildCorePayload({
+    account_number: creds.accountNumber,
+    country: orderInfo.countryCode || 'TT',
+    currency: orderInfo.currency || 'TTD',
+    environment: creds.environment || orderInfo.environment || 'sandbox',
+    fee_structure: orderInfo.feeStructure || 'customer_pay',
+    // method: WiPay's documented Payment Request values are credit_card_co / 3co_simple.
+    // TODO (Wix app-id confusion): an earlier draft passed a placeholder WIX_APP_ID here on the
+    // reading that Wix wants the PSP's Wix app id in Create Transaction. That belongs to the
+    // Wix-side Create Transaction request, not to WiPay's Payment Request body — confirm against
+    // the live Wix reference and keep the two surfaces distinct.
+    method: orderInfo.method || 'credit_card_co',
+    order_id: orderInfo.orderId || coreGenerateOrderId(orderInfo.orderRef || String(Date.now())),
+    origin: orderInfo.origin || 'WaypointWix',
+    return_url: responseUrl,
+    total: total,
+    email: orderInfo.email,
+    prefill: {
+      fname: orderInfo.firstName,
+      lname: orderInfo.lastName,
+      addr1: orderInfo.address1,
+      addr2: orderInfo.address2,
+      city: orderInfo.city,
+      state: orderInfo.state,
+      zipcode: orderInfo.postalCode,
+      country: orderInfo.billingCountry,
+      phone: orderInfo.phone,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -206,18 +212,17 @@ function generateOrderId() {
  *
  * Called when the merchant clicks Connect on the Connect page.
  *
- * options contains the credentials entered on the Connect page plus site info we may need.
- * On success, return the provider account info / credentials Wix will pass to createTransaction()
- * and refundTransaction(). On failure, return an error object instead.
+ * Returns the credentials Wix stores and passes back to createTransaction() and
+ * refundTransaction(). Field ids must match WiPay-config.js.
  *
- * For hosted-page providers, connectAccount is also where we would validate that the merchant's
- * WiPay account is the right type (e.g. BUSINESS/KYC-3 if they need WAPI refunds) and surface
- * clear instructions for any missing credential.
+ * The four fields map onto four separately-authenticated WiPay operations:
+ *   accountNumber   -> Payment Request identity (no auth header)
+ *   accountApiKey   -> buyer-return hash verification (server-side only)
+ *   wapiCredential  -> WAPI refund (X-WAPI-Key OR Bearer, never both)
+ *   webhookSecret   -> webhook HMAC verification (server-side only)
  *
- * TODO (account-type gating on the Connect page): confirm from WiPay which account types can use
- * Payment Request vs WAPI refunds, and surface a clear Connect-page message when a merchant's account
- * cannot yet do one of the flows (e.g. PERSONAL accounts cannot create WAPI Keys and must use OAuth
- * bearer for refunds).
+ * TODO (account-type gating): surface a clear Connect-page message when a merchant's account type
+ * cannot do a flow (PERSONAL accounts cannot create WAPI Keys and must use OAuth bearer).
  */
 export function connectAccount(options, context) {
   const creds = options || {};
@@ -232,15 +237,28 @@ export function connectAccount(options, context) {
   if (!accountApiKey) {
     return { error: 'Account API Key is required for buyer-return hash verification.' };
   }
+  if (wapiCredential && !wapiEnvironment(wapiCredential) && !looksLikeBearer(wapiCredential)) {
+    return {
+      error:
+        'WAPI credential must be a WAPI Key (wapi_live_... or wapi_test_...) or an OAuth bearer token.',
+    };
+  }
 
-  // Return the credentials Wix will store and pass to createTransaction / refundTransaction.
-  // Field IDs here must match the credential field names declared in WiPay-config.js.
   return {
     accountNumber,
     accountApiKey,
     wapiCredential,
     webhookSecret,
+    environment: creds.environment || 'sandbox',
   };
+}
+
+function looksLikeBearer(value) {
+  const v = String(value == null ? '' : value).trim();
+  // OAuth bearer access tokens are long opaque strings; WAPI Keys are prefixed and self-identify.
+  // Anything that is not a WAPI key is treated as a bearer token, which is why connectAccount
+  // accepts it. Empty is rejected upstream.
+  return v.length >= 20 && !v.startsWith('wapi_');
 }
 
 // ---------------------------------------------------------------------------
@@ -252,31 +270,24 @@ export function connectAccount(options, context) {
  *
  * Called by Wix when the buyer clicks Place Order.
  *
- * Contract:
- *   1. Build the WiPay Payment Request payload.
- *   2. Call WiPay Payments API create-a-payment-request.
- *   3. Read transaction_id from the WiPay response and store it as pluginTransactionId.
- *   4. Return the hosted checkout URL as the redirect target.
+ * WiPay side (implemented):
+ *   1. Build the Payment Request payload (correct field names via wipay-core.js).
+ *   2. POST to {base}/plugins/payments/request with Accept: application/json.
+ *   3. Validate the response shape (200, JSON, https wipayfinancial.com URL, plausible txn id).
+ *   4. Pin the original total under the transaction id and inside `data`.
+ *   5. Return the hosted checkout URL as the redirect target.
  *
- * In Wix's hosted-page / redirection flow, Wix sends order.returnUrls (success / error / cancel /
- * pending) in the Create Transaction request, the PSP returns redirectUrl, and Wix opens that
- * redirectUrl in an iframe or browser window for the buyer to complete. The buyer then lands on the
- * appropriate returnUrl, and the PSP sends the status to Wix through Submit Event.
+ * Wix side (partially confirmed):
+ *   - The plugin must return pluginTransactionId so Wix can correlate across the redirect.
  *
- * Saving pluginTransactionId is required so Wix can correlate the transaction across the redirect,
- * the buyer return, and the later refund.
+ * TODO (exact Wix return property for hosted-page redirect): confirm from the Wix reference whether
+ * Wix expects `redirectUrl` or a different property name, and whether more fields are required.
  *
- * TODO (exact Wix return property for hosted-page redirect): confirm from Wix reference which property
- * Wix expects createTransaction() to return for a hosted-page redirect (the documentation names
- * redirectUrl in the return shape; confirm whether Wix wants exactly that property name or a different
- * one, and whether any additional fields are required). Do not ship a return shape that does not match
- * the Wix reference.
- *
- * TODO (exact createTransaction request shape from Wix): Wix passes order data into createTransaction();
- * confirm the exact fields Wix provides here so we read the right order properties instead of guessing
- * properties that may not exist.
+ * TODO (exact createTransaction request shape from Wix): confirm the exact fields Wix puts on
+ * `options` so order properties are read rather than guessed. The reads below accept several
+ * plausible spellings and fall through to a hard error instead of silently paying 0.
  */
-export function createTransaction(options, context) {
+export async function createTransaction(options, context) {
   const creds = context.credentials;
   if (!creds || !creds.accountNumber) {
     throw new Error('WiPay account not connected. Connect from Accept Payments first.');
@@ -285,51 +296,55 @@ export function createTransaction(options, context) {
     throw new Error('Account API Key is required for buyer-return hash verification.');
   }
 
-  // --- read the order from Wix options ---
-  // TODO: confirm the exact fields Wix puts on options/order here.
+  const o = options || {};
+  const order = o.order || o;
+
   const orderInfo = {
-    total: options.amount ? Number(options.amount) : 0,
-    currency: options.currency || context.currency,
-    countryCode: options.countryCode,
-    feeStructure: options.feeStructure,
-    method: options.method,
-    orderId: options.orderId,
-    origin: options.origin,
-    responseUrl: options.responseUrl,
-    email: options.email,
-    firstName: options.firstName,
-    lastName: options.lastName,
-    phone: options.phone,
-    items: options.items,
+    total: firstNumber(o.amount, order.amount, order.total, o.total),
+    currency: o.currency || order.currency || context.currency,
+    countryCode: o.countryCode || order.countryCode || order.billingCountry,
+    environment: o.environment || order.environment,
+    feeStructure: o.feeStructure || order.feeStructure,
+    method: o.method,
+    orderId: o.orderId || order.orderId || order._id,
+    orderRef: o.orderId || order._id || o.wixTransactionId,
+    origin: o.origin,
+    responseUrl: o.responseUrl || (order.returnUrls && order.returnUrls.success),
+    returnUrls: order.returnUrls,
+    email: o.email || order.buyerInfo && order.buyerInfo.email,
+    firstName: o.firstName || order.buyerInfo && order.buyerInfo.firstName,
+    lastName: o.lastName || order.buyerInfo && order.buyerInfo.lastName,
+    phone: o.phone || order.buyerInfo && order.buyerInfo.phone,
+    address1: o.address1 || order.shippingAddress && order.shippingAddress.streetAddress,
+    address2: o.address2,
+    city: o.city || order.shippingAddress && order.shippingAddress.city,
+    state: o.state || order.shippingAddress && order.shippingAddress.zipCode,
+    postalCode: o.postalCode || order.shippingAddress && order.shippingAddress.postalCode,
+    billingCountry: o.billingCountry || order.billingAddress && order.billingAddress.country,
   };
 
   if (!orderInfo.total || isNaN(orderInfo.total) || orderInfo.total <= 0) {
     throw new Error('Order total is required by WiPay Payment Request and was not provided by Wix.');
   }
 
-  // --- build Payment Request payload ---
-  const payload = buildPaymentRequest(options, context, orderInfo);
+  const payload = buildPaymentRequest(o, context, orderInfo);
+  const originalTotal = Number(orderInfo.total).toFixed(2);
 
-  // --- call WiPay Payments API (create-a-payment-request) ---
-  const wiPayResponse = callPaymentRequestApi(payload, creds);
+  // Pin the amount in `data` so the buyer-return callback can recover it from WiPay's echo.
+  payload.data = JSON.stringify({
+    order_id: payload.order_id,
+    total: originalTotal,
+  });
 
-  // --- store pluginTransactionId ---
-  // TODO: confirm whether Wix expects pluginTransactionId to be returned inside the transaction object
-  // or as a top-level property. The tutorial establishes that Wix needs the PSP's transaction id stored
-  // and returned so it can correlate the transaction later.
+  const wiPayResponse = await callPaymentRequestApi(payload, creds, orderInfo);
+
   const pluginTransactionId = wiPayResponse.transaction_id;
   if (!pluginTransactionId) {
     throw new Error('WiPay returned no transaction_id. Payment Request failed or response shape changed.');
   }
 
-  // --- remember the original total for later hash verification ---
-  // The buyer-return hash must be computed over the original submitted amount, not the returned total.
-  // We must store it somewhere retrievable by pluginTransactionId.
-  // TODO: store originalTotal keyed by pluginTransactionId using the chosen Wix-side store.
-  const originalTotal = orderInfo.total.toFixed(2);
   rememberOriginalTotal(pluginTransactionId, originalTotal);
 
-  // --- return the hosted checkout URL ---
   const redirectUrl = wiPayResponse.url;
   if (!redirectUrl) {
     throw new Error('WiPay returned no hosted checkout URL. Payment Request succeeded but no redirect URL.');
@@ -339,9 +354,16 @@ export function createTransaction(options, context) {
   return {
     pluginTransactionId,
     redirectUrl,
-    // TODO: confirm whether Wix expects any other return fields for hosted-page flows.
-    // Examples from Wix docs surface: statusCode, confirmation, order (with returnUrls), etc.
   };
+}
+
+function firstNumber(...values) {
+  for (const v of values) {
+    if (v == null || v === '') continue;
+    const n = Number(v);
+    if (isFinite(n) && n > 0) return n;
+  }
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,86 +375,65 @@ export function createTransaction(options, context) {
  *
  * Called by Wix when a merchant initiates a refund from the Orders dashboard.
  *
- * Contract (WiPay side):
- *   - WiPay provides a WAPI refund endpoint. The documented WAPI refund operation is a refund REQUEST
- *     whose success response is currently documented as:
- *       { "message": "Refund request successfully created." }
- *     The definitive refund OUTCOME is reported via webhooks (refund event), not via the immediate
- *     refund-request response.
+ * WiPay side (implemented): POST {base}/wapi/transactions/{id}/refund with exactly ONE of
+ * `Authorization: Bearer` or `X-WAPI-Key`, selected from the credential's form. WiPay documents the
+ * success response as {"message": "Refund request successfully created."} with no refund id, and
+ * the definitive outcome arrives via webhook — so this returns PENDING, never COMPLETED.
  *
- * Contract (Wix side):
- *   - Wix expects refundTransaction() to return a pluginRefundId and to report the refund completion
- *     back through the provider status callback (submitEvent / the HTTP callback path). Wix correlates
- *     refunds using pluginTransactionId + pluginRefundId.
+ * Wix side (unconfirmed): Wix expects a pluginRefundId and completion reported through the
+ * provider callback. Because WiPay's endpoint is a refund *request* with no id, we derive a
+ * plugin-local id and report PENDING until a webhook confirms.
  *
- * Reconciling the two: we call the WAPI refund endpoint for the WiPay transaction, then we must report
- * the refund status back to Wix in the way Wix expects. Because WiPay's documented refund response is a
- * request confirmation (not a completed refund with an id), we currently:
- *   1. Create the WAPI refund request.
- *   2. Use the WiPay refund reference (if the WAPI response carries one) as pluginRefundId; if the WAPI
- *      response does not carry a usable refund id, we derive a plugin-local refund id.
- *   3. Report the refund back to Wix via the callback path as PENDING until the webhook confirms
- *      completion, then mark it COMPLETED.
+ * TODO (WAPI refund response shape): confirm whether the response carries a refund id/reference.
+ * If it does, use it as pluginRefundId instead of the local id.
  *
- * This is a known contract gap that must be resolved for production: WiPay's refund semantics vs Wix's
- * expectation. See the refund section of SERVICE-PLUGIN-CONTRACT-NOTES.md and the TODO there.
- *
- * TODO (WAPI refund response shape): confirm the exact WAPI refund response fields (does it return a
- * refund id/reference, a status, or just the message string?). If it returns a refund reference, use that
- * as pluginRefundId. If not, use a local refund id and rely on webhooks for completion.
- *
- * TODO (WAPI auth for refunds): refund auth uses EITHER X-WAPI-Key OR OAuth bearer Authorization, never
- * both. The WAPI credential field stores whichever form the merchant has. A BUSINESS account with a
- * verified WAPI Key uses X-WAPI-Key; a PERSONAL account uses OAuth bearer. Decide the auth strategy from
- * the account type / credential form rather than assuming one.
+ * TODO (exact Wix refund error-code contract): do not invent error codes. The Reason Codes page
+ * snippet hinted at 3022-3025 but was not extractable; confirm the full allowed list before
+ * shipping a failure result.
  */
-export function refundTransaction(options, context) {
+export async function refundTransaction(options, context) {
   const creds = context.credentials;
   if (!creds) {
     throw new Error('WiPay credentials are missing from context.');
   }
 
   const pluginTransactionId = options.pluginTransactionId;
-  if (!pluginTransactionId) {
-    throw new Error('pluginTransactionId is required for WiPay refunds (Wix must pass it).');
+  if (!pluginTransactionId || !isValidTransactionId(pluginTransactionId)) {
+    throw new Error('A valid pluginTransactionId is required for WiPay refunds.');
   }
 
-  const refundAmount = options.amount ? Number(options.amount) : 0;
+  const refundAmount = Number(options.amount);
   if (!refundAmount || isNaN(refundAmount) || refundAmount <= 0) {
     throw new Error('Refund amount is required.');
   }
 
-  // --- call WAPI refund endpoint ---
-  const wiPayRefundResponse = callWapiRefund(
+  const wiPayRefundResponse = await callWapiRefund(
     creds,
     pluginTransactionId,
     refundAmount,
-    options.reason || 'Refund initiated from Wix Orders'
+    options.reason || 'Refund initiated from Wix Orders',
+    options.countryCode
   );
 
-  // --- determine pluginRefundId ---
-  // WiPay's documented refund success response is currently just a message. If the WAPI response carries
-  // a refund reference / id, prefer that. Otherwise use a local refund id.
-  const refundIdFromWiPay = wiPayRefundResponse.refund_id || wiPayRefundResponse.refundReference;
-  const pluginRefundId = refundIdFromWiPay || 'WIPAY-REFUND-' + generateOrderId();
+  if (wiPayRefundResponse.error) {
+    // Surface the transport/API failure instead of reporting a refund that never happened.
+    throw new Error('WiPay WAPI refund request failed: ' + wiPayRefundResponse.error);
+  }
 
-  // --- report back to Wix ---
-  // Refund is initially reported as PENDING; the webhook / buyer-return flow should confirm completion
-  // and update the Wix order. TODO: confirm the exact Wix submitEvent shape for refund status updates
-  // (status, pluginRefundId, amount, etc.).
-  const refundStatusReport = {
+  const refundIdFromWiPay =
+    wiPayRefundResponse.refund_id || wiPayRefundResponse.refundReference || wiPayRefundResponse.id;
+  const pluginRefundId = refundIdFromWiPay || 'WIPAY-REFUND-' + coreGenerateOrderId(pluginTransactionId + ':' + refundAmount);
+
+  // TODO (submitEvent shape): report PENDING here via the Wix provider status callback once the
+  // exact submitEvent schema is confirmed. Async report is the expected pattern; do not block on
+  // the webhook inside this function.
+  return {
     pluginTransactionId,
     pluginRefundId,
     status: 'PENDING',
     amount: refundAmount,
     message: wiPayRefundResponse.message || 'Refund request submitted to WiPay.',
   };
-
-  // TODO: call the Wix provider status callback (submitEvent or HTTP function) to mark the refund PENDING
-  // here, then mark COMPLETED when the webhook confirms. Do not block this function waiting for a webhook;
-  // async report is the expected pattern.
-
-  return refundStatusReport;
 }
 
 // ---------------------------------------------------------------------------
@@ -442,38 +443,27 @@ export function refundTransaction(options, context) {
 /**
  * handleBuyerReturn(request)
  *
- * Public HTTPS HTTP function that receives WiPay's GET response at response_url.
+ * Receives WiPay's GET at response_url and verifies it before anything is trusted.
  *
- * Flow:
- *   1. Read the query parameters from WiPay's response.
- *   2. Verify the response hash with the account API key + the original order total.
- *   3. On success, call submitEvent() to mark the transaction success so the order appears in Wix Orders.
- *      On failure, call submitEvent() to mark failure.
+ * Rules enforced here (all from the confirmed WiPay contract):
+ *   - The hash is REQUIRED for a success return. WiPay returns it only on success, so a success
+ *     with no hash is a forgery attempt or a contract break: reject it.
+ *   - The hash is recomputed over the ORIGINAL submitted amount recovered from the `data` echo or
+ *     the local store — never over the buyer-visible `total` in the redirect.
+ *   - Comparison is constant-time; a failed verification returns 400 and never reports success.
+ *   - A return with no recoverable original total is rejected rather than verified against a guess.
  *
- * The hash verification must happen server-side using the account API key (a secret credential) and the
- * original pinned amount. The hash formula and the "123-is-for-hash-only" sandbox rule are described in
- * the WiPay Payments API introduction.
+ * TODO (exact response_url query fields): confirm the exact query parameter names WiPay posts.
+ * The reads below accept the documented common spellings.
  *
- * Hash formula (from WiPay docs):
- *   md5(transaction_id + original_total + api_key)
- *   - transaction_id is WiPay's transaction_id from the redirect.
- *   - original_total is the original submitted amount formatted to exactly two decimals (e.g. "10.00").
- *   - api_key is the account API Key (sandbox: "123" for hash verification only).
- *
- * TODO (exact response_url query fields): confirm the exact query parameters WiPay posts to response_url
- * from the Payments API docs (status, order_id, transaction_id, pin, hash, etc.). Use the real field names
- * to read the response.
- *
- * TODO (Wix submitEvent exact shape): confirm the exact submitEvent() shape Wix expects for a transaction
- * status update (event type, status value, transaction reference). Use real values once confirmed.
+ * TODO (submitEvent shape): map the verified status to a Wix submitEvent call once the exact event
+ * schema is confirmed from the live reference.
  */
-export function handleBuyerReturn(request) {
-  const query = request.query;
-  if (!query) {
-    return { body: 'missing query', statusCode: 400 };
-  }
+export function handleBuyerReturn(request, deps) {
+  const query = (request && request.query) || {};
+  const credentials = (deps && deps.credentials) || {};
 
-  const apiKey = getAccountApiKey(); // TODO: read from context / stored creds, server-side only
+  const apiKey = credentials.accountApiKey;
   if (!apiKey) {
     return { body: 'account API key unavailable', statusCode: 500 };
   }
@@ -482,188 +472,206 @@ export function handleBuyerReturn(request) {
   const returnedStatus = query.status;
   const returnedTotal = query.total;
   const returnedHash = query.hash;
+  const dataEcho = query.data;
 
   if (!transactionId || !returnedStatus) {
     return { body: 'incomplete WiPay return', statusCode: 400 };
   }
 
-  // --- hash verification ---
-  // We must verify the hash against the ORIGINAL total, not the returned total.
-  // The sandbox API key "123" is for hash verification only.
-  const originalTotal = resolveOriginalTotal(transactionId);
-  const expectedHash = computeResponseHash(transactionId, originalTotal, apiKey);
-
-  // Only verify hash when WiPay included one (sandbox may not always include hash; confirm from docs).
-  if (returnedHash && returnedHash !== expectedHash) {
-    // Hash mismatch — untrusted response.
-    return { body: 'hash verification failed', statusCode: 400 };
+  const status = String(returnedStatus).toLowerCase();
+  if (status !== 'success' && status !== 'failed') {
+    return { body: 'unrecognized WiPay status', statusCode: 400 };
   }
 
-  // --- map WiPay status to a Wix event ---
-  // TODO: call submitEvent() with the real Wix shape. Pseudocode:
-  //   if (returnedStatus === 'success') {
-  //     submitEvent({
-  //       event: {
-  //         transaction: {
-  //           wixTransactionId: query["wixTransactionId"],
-  //           pluginTransactionId: transactionId,
-  //           // ... other event properties per Wix reference
-  //         }
-  //       }
-  //     });
-  //   } else {
-  //     submitEvent({ event: { transaction: { ... failure shape ... } } });
-  //   }
+  if (status === 'success') {
+    // Success without a hash: reject. There is no legitimate success return without one.
+    if (!returnedHash) {
+      return { body: 'hash missing on success', statusCode: 400 };
+    }
 
-  return { body: 'RECEIVED' };
+    const originalTotal = resolveOriginalTotal(transactionId, dataEcho);
+    if (!originalTotal) {
+      return { body: 'original total unavailable for verification', statusCode: 400 };
+    }
+
+    if (!verifyResponseHash(transactionId, originalTotal, apiKey, returnedHash)) {
+      return { body: 'hash verification failed', statusCode: 400 };
+    }
+
+    // Hash verified against the pinned original total. Note we deliberately do NOT use
+    // returnedTotal for anything security-relevant.
+    return {
+      body: 'RECEIVED',
+      statusCode: 200,
+      verified: true,
+      transactionId,
+      originalTotal,
+      status: 'success',
+    };
+  }
+
+  // Failure returns carry no hash by design; report the failure without claiming verification.
+  return {
+    body: 'RECEIVED',
+    statusCode: 200,
+    verified: false,
+    transactionId,
+    returnedTotal: returnedTotal || null,
+    status: 'failed',
+  };
 }
 
 /**
  * handleRefundStatus(request)
  *
- * HTTP function that receives refund status updates from WiPay (or from the Wix provider callback path)
- * and reports completion back to Wix via submitEvent / the Wix callback.
- *
- * TODO (exact refund callback path): confirm from Wix reference whether Wix expects a separate HTTP
- * function for refund status or whether both transaction and refund status flows through the same path.
- * Also confirm the exact fields Wix expects in the refund completion call.
+ * TODO (exact refund callback path): confirm whether Wix routes refund status through a separate
+ * HTTP function or the same path as the buyer return, and the exact fields Wix expects on refund
+ * completion. WiPay's definitive refund outcome arrives via webhook (payment.refunded /
+ * payment.refund_rejected), so this stays a pass-through until that mapping is confirmed.
  */
 export function handleRefundStatus(request) {
-  // TODO: read refund status, verify any signature if WiPay signs refund callbacks, and call submitEvent()
-  // to mark the refund COMPLETED once confirmed.
   return { body: 'RECEIVED' };
 }
 
 /**
  * handleWebhook(request)
  *
- * Consumes signed WiPay webhooks for lifecycle events: success, failure, refund, chargeback, fraud.
+ * Verifies a signed WiPay webhook: HMAC-SHA256 over `timestamp + "." + raw_body` with the endpoint
+ * signing secret, constant-time compared, within a ±300s window, then deduplicated by
+ * X-WiPay-Webhook-Id.
  *
- * Verification:
- *   - Verify the HMAC signature using the webhook signing secret.
- *   - Verify the timestamp window (reject stale events).
- *   - Dedup by webhook id (ignore already-processed events).
+ * Verification is real and tested in tests/harness.mjs. Event-to-Wix mapping is not wired yet.
  *
- * On a verified event, map it to a Wix order update via submitEvent() where appropriate.
- *
- * TODO (webhook in scope for first cut): if webhooks are not in scope yet, leave this handler stubbed and
- * do not wire it into the callback path. The webhookSecret credential is already declared in getConfig()
- * for when we do.
+ * TODO (webhook scope): confirm which lifecycle events map to which Wix updates, and wire dedupe
+ * storage (X-WiPay-Webhook-Id is reused across retries and is the idempotency key).
  */
-export function handleWebhook(request) {
-  // TODO: verify HMAC signature + timestamp window, dedup by webhook id, map event to Wix.
-  return { body: 'RECEIVED' };
+export function handleWebhook(request, deps) {
+  const credentials = (deps && deps.credentials) || {};
+  const secret = credentials.webhookSecret;
+  if (!secret) {
+    return { body: 'webhook secret unavailable', statusCode: 500 };
+  }
+
+  const headers = (request && request.headers) || {};
+  const signature =
+    headers['x-wipay-webhook-signature'] || headers['X-WiPay-Webhook-Signature'];
+  const timestamp =
+    headers['x-wipay-webhook-timestamp'] || headers['X-WiPay-Webhook-Timestamp'];
+  const webhookId =
+    headers['x-wipay-webhook-id'] || headers['X-WiPay-Webhook-Id'];
+
+  const rawBody = typeof request.body === 'string' ? request.body : JSON.stringify(request.body || {});
+
+  if (!signature || !timestamp) {
+    return { body: 'missing webhook signature headers', statusCode: 400 };
+  }
+
+  if (!verifyWebhookSignature(rawBody, timestamp, signature, secret)) {
+    return { body: 'webhook signature verification failed', statusCode: 401 };
+  }
+
+  // TODO: persist webhookId to dedupe before acting on the event.
+  return { body: 'RECEIVED', statusCode: 200, webhookId: webhookId || null };
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers (stubs — replace with real implementations)
+// Internal helpers — real WiPay calls
 // ---------------------------------------------------------------------------
 
 /**
- * callPaymentRequestApi(payload, creds)
+ * callPaymentRequestApi(payload, creds, orderInfo)
  *
- * Calls the WiPay Payments API create-a-payment-request endpoint.
+ * POSTs the Payment Request to the territory/sandbox endpoint and validates the response.
  *
- * Auth: the Payment Request endpoint accepts the account number as identity; it does NOT require a
- * separate auth header for the Payment Request itself (confirm against the live API reference).
- *
- * TODO (exact endpoint URL + request shape): confirm the exact endpoint URL and the exact fields WiPay
- * accepts from the live API reference. The payload built above uses the field names from the WiPay Payment
- * Request introduction; confirm spelling and required vs optional fields.
+ * Auth: the Payment Request endpoint takes the account number as identity in the body and requires
+ * NO auth header. `Accept: application/json` is required — without it the endpoint answers 302
+ * with an HTML redirect to the hosted page (browser-facing behaviour), which is not a parseable
+ * session response. This was verified live against the TT sandbox.
  */
-function callPaymentRequestApi(payload, creds) {
-  // TODO: implement the real HTTPS call to the WiPay Payments API.
-  // Example shape (confirm from live docs):
-  //   POST https://ttsb.wipayfinancial.com/plugins/payments/request  (TT sandbox)
-  //   Body: the payload built in buildPaymentRequest()
-  //
-  // On success, the WiPay response includes transaction_id and url (the hosted checkout URL).
-  // Return the parsed response.
-  return {
-    transaction_id: 'wiPay-sandbox-tx-' + generateOrderId(),
-    url: 'https://sandbox.wipay.com/checkout/wipay-sandbox-checkout-' + generateOrderId(),
-    // TODO: include any other response fields WiPay returns (status, order_id, etc.) once confirmed.
-  };
+export async function callPaymentRequestApi(payload, creds, orderInfo) {
+  const environment = creds.environment || (orderInfo && orderInfo.environment) || 'sandbox';
+  const country = (orderInfo && orderInfo.countryCode) || payload.country_code || 'TT';
+  const url = paymentEndpoint(country, environment);
+  if (!url) {
+    return { error: 'unsupported_country' };
+  }
+
+  const doFetch = transportOverride || runtimeFetch();
+  let res;
+  try {
+    res = await doFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    return { error: 'network: ' + (e && e.message ? e.message : String(e)) };
+  }
+
+  const text = await res.text();
+  const parsed = parseCheckoutResponse(res.status, text);
+  return parsed;
 }
 
 /**
- * callWapiRefund(creds, pluginTransactionId, amount, reason)
+ * callWapiRefund(creds, pluginTransactionId, amount, reason, countryCode)
  *
- * Calls the WiPay WAPI refund endpoint.
+ * POSTs the WAPI refund request with EXACTLY ONE auth header:
+ *   - WAPI Key (wapi_live_... / wapi_test_...) -> `X-WAPI-Key`
+ *   - otherwise -> `Authorization: Bearer ...`
+ * Sending both, neither, or a wrong-environment key is a 401 per the WAPI contract.
  *
- * Auth rules (do NOT combine):
- *   - WAPI Key: send as X-WAPI-Key header.
- *   - OAuth bearer: send as Authorization: Bearer <token>.
- *   - A BUSINESS account with a verified WAPI Key uses X-WAPI-Key.
- *   - A PERSONAL account uses OAuth bearer.
- *
- * Environment scoping: WAPI Keys are prefixed by environment (wapi_live_... vs wapi_test_...).
- * Use the matching key for the transaction's environment. Do not cross environments.
- *
- * TODO (exact WAPI refund endpoint + request shape + response shape): confirm from the WiPay WAPI docs
- * the exact endpoint, the exact refund request fields (transaction id, amount, reason, etc.), and the
- * exact response shape. The current implementation treats the documented success response ("Refund request
- * successfully created.") as the baseline and expects a possible refund id/reference field that needs
- * confirmation.
+ * Environment is derived from the WAPI key's own prefix so a live key never authenticates a
+ * sandbox endpoint (and vice versa).
  */
-function callWapiRefund(creds, pluginTransactionId, amount, reason) {
-  // TODO: implement the real HTTPS call to the WiPay WAPI refund endpoint.
-  // Decide auth from creds.wapiCredential form:
-  //   - if it looks like a WAPI Key (per the documented prefix), send X-WAPI-Key
-  //   - otherwise send Authorization: Bearer ...
-  //
-  // Example shape (confirm from live docs):
-  //   POST https://api.wipay.com/wapi/transactions/{transaction_id}/refund  (or the actual endpoint)
-  //   Body: { transaction_id: pluginTransactionId, amount, reason }  (or path-only, confirm from docs)
-  //
-  // On success, WiPay currently documents the response as:
-  //   { "message": "Refund request successfully created." }
-  // If the response also carries a refund id/reference field, use it. If not, the refund outcome arrives
-  // via webhooks.
-  return {
-    message: 'Refund request successfully created.',
-    // TODO: include refund_id / refund reference if WiPay returns one.
-  };
-}
+export async function callWapiRefund(creds, pluginTransactionId, amount, reason, countryCode) {
+  const credential = String(creds.wapiCredential == null ? '' : creds.wapiCredential).trim();
+  if (!credential) {
+    return { error: 'missing WAPI credential' };
+  }
 
-/**
- * computeResponseHash(transactionId, originalTotal, apiKey)
- *
- * Computes the buyer-return response hash per WiPay's documented formula:
- *   md5(transaction_id + original_total + api_key)
- *
- * This must use the ACCOUNT API KEY (not the WAPI credential, not the webhook secret).
- * Sandbox api_key for hash verification is "123".
- */
-function computeResponseHash(transactionId, originalTotal, apiKey) {
-  // TODO: implement MD5 in the Wix runtime or call a server-side crypto helper.
-  // Do not use the buyer-facing total; use the original submitted total formatted to two decimals.
-  // return md5(transactionId + originalTotal + apiKey);
-  return 'TODO-implementation-needed';
-}
+  const keyEnvironment = wapiEnvironment(credential);
+  const environment = keyEnvironment || creds.environment || 'sandbox';
+  if (keyEnvironment && creds.environment && keyEnvironment !== creds.environment) {
+    return { error: 'wapi_key_environment_mismatch' };
+  }
 
-/**
- * getAccountApiKey()
- *
- * Returns the account API key from the stored credentials.
- *
- * WARNING: this is a secret credential. Keep it server-side only; do not log it, do not return it to the
- * browser, do not put it in any client-visible response. Use it only for hash verification and for any other
- * server-side operation the Payments API requires.
- */
-function getAccountApiKey() {
-  // TODO: read from context.credentials.accountApiKey (server-side storage).
-  return null;
-}
+  const path = '/transactions/' + encodeURIComponent(pluginTransactionId) + '/refund';
+  const url = wapiEndpoint(countryCode || 'TT', environment, path);
+  if (!url) {
+    return { error: 'unsupported_country' };
+  }
 
-/**
- * rememberOriginalTotal(pluginTransactionId, originalTotal)
- *
- * Stores the original submitted total so the buyer-return callback can recompute the hash later.
- *
- * TODO: implement using a real Wix-side store keyed by pluginTransactionId (Wix order metadata, plugin
- * state, or the `data` pass-through echoed back by WiPay).
- */
-function rememberOriginalTotal(pluginTransactionId, originalTotal) {
-  // TODO: persist originalTotal for this pluginTransactionId.
+  const headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+  if (keyEnvironment) {
+    headers['X-WAPI-Key'] = credential;
+  } else {
+    headers['Authorization'] = 'Bearer ' + credential;
+  }
+
+  const body = { amount: Number(amount).toFixed(2) };
+  if (reason) body.reason = String(reason).slice(0, 255);
+
+  const doFetch = transportOverride || runtimeFetch();
+  let res;
+  try {
+    res = await doFetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    return { error: 'network: ' + (e && e.message ? e.message : String(e)) };
+  }
+
+  const text = await res.text();
+  if (res.status !== 200 && res.status !== 201) {
+    return { error: 'http_' + res.status + ': ' + text.slice(0, 200) };
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { message: text };
+  }
 }
